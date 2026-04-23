@@ -1,0 +1,24 @@
+# 予約PDF・出力Excel（個人情報のため除外）
+input/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# 開発・作業ファイル
+.env
+*.log
+.DS_Store
+Thumbs.db
+*.docx
+ref_inspect.txt
+seating.html
