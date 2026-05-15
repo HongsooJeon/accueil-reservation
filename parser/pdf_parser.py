@@ -37,21 +37,35 @@ RE_TIME_END    = re.compile(r'[〜～~](\d{1,2}:\d{2})')
 RE_NAME        = re.compile(r'([ァ-ヶー\s　]+)\s*様')
 RE_PARTY       = re.compile(r'(\d+)\s*人')
 RE_TABLE       = re.compile(r'テーブル\s*(\w+)')
-RE_SOURCE      = re.compile(r'(.+?)\s*[（(]取込[）)]')
+RE_SOURCE      = re.compile(r'([^\s【】（(]+)\s*[（(]取込[）)]')
 RE_PRICE_TOT   = re.compile(r'合計金額[（(]税[・.]?サ?込[）)]\s*[：:]\s*([\d,]+)\s*円')
 RE_PRICE_PAY   = re.compile(r'支払[いi]?\s*金額[（(]税[・.]?サ?込[）)]\s*[：:]\s*([\d,]+)\s*円')
 RE_OZ_POINT    = re.compile(r'OZポイント\s*[：:]\s*([\d,]+)')
 RE_OZ_DAY      = re.compile(r'[ＯO][ＺZ]の日[^：:]*[：:]\s*(.+)')
 RE_ALLERGY_FLAG = re.compile(r'●\s*アレルギー')
-RE_ANNIV_MSG   = re.compile(r'回答[：:]\s*(.+)')
+RE_ANNIV_MSG   = re.compile(r'回答[：:][^\S\n]*(.+)')  # [^\S\n]*: 改行を除く水平空白のみ消費
 RE_NOTES       = re.compile(r'お客様[よりのご]*[要望リクエスト]*[：:]\s*(.+)')
 RE_PURPOSE_KW  = re.compile(r'(女子会|誕生日|バースデー|記念日|デート|同窓会|歓迎会|送別会|結婚記念|家族|ファミリー)')
 RE_OZ_PLAN     = re.compile(r'OZmallプラン名[：:]\s*(.+)')
 RE_PLAN_LINE   = re.compile(r'プラン名[：:]\s*(.+)')
+# 食べログ: メッセージプレート質問の直後の回答を特定する
+RE_TABELOG_PLATE_ANS = re.compile(
+    r'質問[：:][^\S\n]*(?:メッセージ[^\n]*プレート|誕生日[^\n]*メッセージ|記念日[^\n]*メッセージ)[^\n]*\n回答[：:][^\S\n]*(.+)',
+    re.IGNORECASE,
+)
+# 食べログ補完: メッセージプレート質問があるブロックかどうかを判定
+RE_TABELOG_MSG_Q = re.compile(
+    r'質問[：:]\s*(?:メッセージ[^\n]*プレート|誕生日[^\n]*メッセージ|記念日[^\n]*メッセージ)',
+    re.IGNORECASE,
+)
+# お客様よりのご要望がプレートメッセージらしい文言かを判定
+RE_PLATE_MSG_KW = re.compile(r'Happy|HAPPY|happy|HBD|おめでとう|ハッピーバースデー|Congrat', re.IGNORECASE)
 
 # AT集計対象キーワード
-AT_KEYWORDS = ["いちごみるく", "アフタヌーンティー", "AT＋", "AT+"]
+AT_KEYWORDS = ["いちごみるくアフタヌーンティー", "チェリーアフタヌーンティー", "アフタヌーンティー", "AT＋", "AT+", "チェリーAT"]
 ANIVA_KEYWORDS = ["アニバーサリーランチ", "アニバランチ"]
+# ハイティー集計対象キーワード
+HT_KEYWORDS = ["いちごみるくハイティー", "チェリーハイティー", "ハイティー", "チェリーHT"]
 
 
 def _parse_int(text: str) -> Optional[int]:
@@ -194,6 +208,44 @@ def _parse_block(block: list[str]) -> Reservation:
                     r.plan = 'いちごみるくアフタヌーンティー'
                 break
 
+    # 直接/HP予約のチェリーATプラン検出（PDF多段組分割）
+    # 「チェリーアフタヌーンテ」「ィー＊option」が別行に分割される場合
+    if not r.plan:
+        for i, line in enumerate(block):
+            if 'チェリーアフタヌーンテ' in line:
+                option = None
+                for j in range(i, min(i + 4, len(block))):
+                    m = re.search(r'ィー[＊*]([^\s●]{2,})', block[j])
+                    if m:
+                        option = m.group(1)
+                        option = re.sub(r'Web予約.*|お一人様.*|OK\d.*|\([^\)]*\)$', '', option)
+                        option = re.sub(r'付[き]?$', '', option).strip()
+                        break
+                r.plan = f'チェリーアフタヌーンティー＊{option}' if option else 'チェリーアフタヌーンティー'
+                break
+
+    # 直接/HP予約のハイティープラン検出（PDF多段組分割）
+    # 「チェリーハイ」で行末が切れる場合も考慮して広めにマッチ
+    if not r.plan:
+        for i, line in enumerate(block):
+            is_cherry = 'チェリーハイ' in line  # チェリーハイティー または 行末截断の チェリーハイ
+            is_ichigo  = 'みるくハイティー' in line
+            if is_cherry or is_ichigo:
+                prefix = 'チェリーハイティー' if is_cherry else 'いちごみるくハイティー'
+                # PDF多段組で分割されるため、周辺行を結合してオプションキーワードを検索
+                window = ' '.join(block[i:min(i + 5, len(block))])
+                opts = []
+                if 'SpecialTea' in window or 'Special Tea' in window:
+                    opts.append('SpecialTea')
+                if 'スパークリング' in window:
+                    opts.append('乾杯スパークリング')
+                elif '乾杯' in window:
+                    opts.append('乾杯')
+                if re.search(r'[２2][hｈ]|フリーフロー', window):
+                    opts.append('フリーフロー2h')
+                r.plan = prefix + ('＋' + '+'.join(opts) if opts else '')
+                break
+
     # ── 金額 ──────────────────────────────────
     m = RE_PRICE_TOT.search(full_text)
     if m:
@@ -243,17 +295,35 @@ def _parse_block(block: list[str]) -> Reservation:
         r.allergy_detail = "・".join(details)
 
     # ── 記念日メッセージ ───────────────────────
-    m = RE_ANNIV_MSG.search(full_text)
+    # パターン1: 食べログ形式 — メッセージプレート質問の直後の回答を特定して抽出
+    m = RE_TABELOG_PLATE_ANS.search(full_text)
     if m:
         msg = m.group(1).strip()
-        # OZmallの「希望しない」「希望する」「なし」はメッセージなしとみなす
-        if msg and not re.match(r'^希望しない|^希望する|^なし$|^無$', msg):
+        if msg and msg not in ('--', '') and not re.match(r'^なし$|^無$', msg):
             r.anniversary_msg = msg
+
+    # パターン2: OZmall形式 — 「回答[：:]」フィールド（設問/回答形式）
+    if not r.anniversary_msg:
+        m = RE_ANNIV_MSG.search(full_text)
+        if m:
+            msg = m.group(1).strip()
+            # OZmallの「希望しない」「希望する」「なし」はメッセージなしとみなす
+            if msg and not re.match(r'^希望しない|^希望する|^なし$|^無$', msg):
+                r.anniversary_msg = msg
 
     # ── 備考・要望 ─────────────────────────────
     m = RE_NOTES.search(full_text)
     if m:
         r.notes = m.group(1).strip()
+
+    # パターン3: 食べログ補完 — メッセージプレート質問があり回答が空で
+    # お客様よりのご要望にプレートメッセージっぽい文言が入っている場合
+    if not r.anniversary_msg and r.notes:
+        if (RE_TABELOG_MSG_Q.search(full_text)
+                and RE_PLATE_MSG_KW.search(r.notes)
+                and len(r.notes) <= 50):
+            r.anniversary_msg = r.notes
+            r.notes = ''
 
     # ── 直接予約のコース列・備考列テキスト補完 ─────────────
     # ebica PDF の多段組テキストを補完する。
@@ -267,7 +337,7 @@ def _parse_block(block: list[str]) -> Reservation:
     # ●アレルギー後テキストの除外キーワード（フィールドラベル・予約番号など）
     _SKIP_AFTER_ALLERGY = (
         'OZmall', '食べログ', 'ぐるなび', 'ヒトサラ',
-        '予約No', '席名', '[',
+        '予約No', '席名', '[', '予約者名',
     )
     # プランテキストと判断するキーワード（既にplanが取れている場合に除外）
     _PLAN_KW = re.compile(r'【[^】]+】|アフタヌーンティー|平日価格|週末価格|円\s*[（(]税|コース|ランチ|ディナー')
@@ -354,6 +424,13 @@ def _parse_block(block: list[str]) -> Reservation:
                     and not gnavi_note.startswith('['):
                 r.notes = gnavi_note
 
+    # パターン4: 直接予約補完 — 備考の「...」内にプレートメッセージがある場合（notes確定後）
+    # 例: プレートのメッセージは「Happy 2nd Anniversary♡」でお願いします
+    if not r.anniversary_msg and r.notes:
+        m = re.search(r'[「｢]([^」｣]{3,50})[」｣]', r.notes)
+        if m and RE_PLATE_MSG_KW.search(m.group(1)):
+            r.anniversary_msg = m.group(1).strip()
+
     # ── (大人X)(子供Y) 記載を備考に追加 ────────────────────
     child_m = re.search(r'[（(]子供\s*(\d+)[）)]', full_text)
     if child_m:
@@ -408,6 +485,10 @@ def parse_pdf(pdf_path: str) -> list[Reservation]:
 
 def is_at_plan(plan: str) -> bool:
     return any(kw in plan for kw in AT_KEYWORDS)
+
+
+def is_ht_plan(plan: str) -> bool:
+    return any(kw in plan for kw in HT_KEYWORDS)
 
 
 def is_aniva_plan(plan: str) -> bool:

@@ -13,18 +13,27 @@ _PLAN_EXACT = {
 
 # 【】内がこれらを含む場合は「修飾子ブラケット」として読み飛ばす
 _BRACKET_QUALIFIERS = {"ＯＺ限定", "平日価格", "週末価格", "土日価格", "期間限定", "ＯＺ"}
+# 上記に加え、「価格」または「限定」を含むブラケットも修飾子とみなす（例: 土日祝日価格, 平日ディナー限定価格）
+_BRACKET_QUALIFIER_RE = re.compile(r'価格|限定')
 
 # メインプラン名キーワード → 代表ラベル
 _MAIN_KW_MAP = [
+    ("チェリーアフタヌーンティー",     "AT"),
     ("いちごみるくアフタヌーンティー", "AT"),
     ("アフタヌーンティー",             "AT"),
+    ("チェリーハイティー",             "チェリーHT"),
+    ("いちごみるくハイティー",         "ハイティー"),
+    ("ハイティー",                     "ハイティー"),
     ("アニバーサリーランチ",           "アニバーサリーランチ"),
     ("アニバランチ",                   "アニバーサリーランチ"),
     ("夜カフェプラン",                 "夜カフェプラン"),
-    ("スペシャルプラン",               "スペシャルプラン"),
+    ("スペシャルプラン",               "女子会プラン"),
     ("アクイーユセットBプラン",        "アクイーユセットBプラン"),
     ("アクイーユセットAプラン",        "アクイーユセットAプラン"),
     ("お誕生日・記念日をお祝い",       "バースデーコース"),
+    ("最大３ｈ飲み放題",              "女子会プラン＋３H"),
+    ("最大3h飲み放題",               "女子会プラン＋３H"),
+    ("最大3H飲み放題",               "女子会プラン＋３H"),
 ]
 
 # 媒体名の正規化テーブル
@@ -52,8 +61,19 @@ def _clean_opt(opt: str) -> str:
     opt = opt.strip()
     opt = re.sub(r'^選べる', '', opt)
     opt = re.sub(r'(\d+)時間', r'\1h', opt)
+    # ○hカフェフリー → ○H飲み放題（全角数字・大文字H）
+    _ZEN = str.maketrans('0123456789', '０１２３４５６７８９')
+    opt = re.sub(
+        r'([0-9０-９]+)[hｈH]カフェフリー',
+        lambda m: m.group(1).translate(_ZEN) + 'H飲み放題',
+        opt,
+    )
+    # 大文字H → h に統一（半角数字のみ、全角は変換しない）
+    opt = re.sub(r'([0-9]+)H(?=飲み放題|フリー)', lambda m: f'{m.group(1)}h', opt)
     # 2ｈ飲み放題 → 飲み放題2h（順序入れ替え）
     opt = re.sub(r'^([0-9０-９]+)[hｈ]飲み放題', lambda m: f'飲み放題{m.group(1)}h', opt)
+    # ソフトドリンク2H飲み放題 → ソフトDR飲み放題2h
+    opt = re.sub(r'ソフトドリンク([0-9]+)h飲み放題', r'ソフトDR飲み放題\1h', opt)
     opt = re.sub(r'滞在時間無制限', '滞在無制限', opt)
     opt = re.sub(r'滞在カフェフリー', 'カフェフリー', opt)
     opt = re.sub(r'滞在フリータイム', '滞在フリー', opt)
@@ -65,8 +85,8 @@ def _clean_opt(opt: str) -> str:
     opt = re.sub(r'付き$', '', opt).strip()
     # (平日、3/15～4/30) → (平日)  括弧内の日付範囲を除去
     opt = re.sub(r'\(([^）)]+?)[、,]\s*\d{1,2}/\d{1,2}[～~][^)）]{0,15}\)', r'(\1)', opt)
-    # (平日限定) などの末尾修飾子を除去
-    opt = re.sub(r'\((?:平日|週末|土日|期間)[^)]*\)$', '', opt).strip()
+    # (平日限定) / (女性限定) / (土日祝...) などの末尾修飾子を除去
+    opt = re.sub(r'\((?:平日|週末|土日|期間|女性|男性|限定)[^)]*\)$', '', opt).strip()
     # PDF截断による不完全な文字列を補完
     opt = re.sub(r'^メッ$', 'プレート', opt)           # メッセージプレート截断
     opt = re.sub(r'^カフェフ$', 'カフェフリー', opt)   # カフェフリー截断
@@ -75,8 +95,8 @@ def _clean_opt(opt: str) -> str:
 
 def _extract_at_opts(plan: str) -> str:
     """AT系プランの +オプション部分を返す（例: '＋カフェ1杯(平日)'）"""
-    # OZmall スタイル: 【いちごみるくAT】+opts
-    m = re.search(r'【いちごみるくアフタヌーンティー[^】]*】(.+)', plan)
+    # OZmall スタイル: 【いちごみるくAT / チェリーAT】+opts
+    m = re.search(r'【[^】]*アフタヌーンティー[^】]*】(.+)', plan)
     if m:
         raw = m.group(1).lstrip('+＋＆&')
         parts = re.split(r'[+＋＆&]', raw)
@@ -89,13 +109,36 @@ def _extract_at_opts(plan: str) -> str:
                 break
         return '＋' + '+'.join(opts) if opts else ''
 
-    # 直接・HP スタイル: AT＊option or ATとオプション
-    m = re.search(r'いちごみるくアフタヌーンティー[^＊*\n]*[＊*]([^ 　（(\n]+)', plan)
+    # 直接・HP / 食べログ スタイル: (いちごみるく|チェリー)AT＊option
+    m = re.search(r'(?:いちごみるく|チェリー)?アフタヌーンティー[^＊*\n]*[＊*]([^ 　（(\n]+)', plan)
     if m:
         c = _clean_opt(m.group(1))
         if c and len(c) <= 15:
             return '＋' + c
     return ''
+
+
+def _extract_ht_opts(plan: str) -> str:
+    """ハイティー系プランのオプション部分を返す"""
+    # 食べログ/直接生テキスト: ハイティー＊opts（＊区切り）
+    # pdf_parser組み立て済み: ハイティー＋opts（＋区切り）のどちらも処理
+    m = re.search(r'ハイティー[^＊*＋+\n]*[＊*＋+](.+)', plan)
+    if not m:
+        return ''
+    raw = m.group(1)
+    opts = []
+    if 'SpecialTea' in raw or 'Special Tea' in raw:
+        opts.append('SpecialTea')
+    if 'スパークリング' in raw:
+        opts.append('乾杯スパークリング')
+    elif '乾杯' in raw:
+        opts.append('乾杯')
+    if re.search(r'[２2][hｈ]|2時間', raw):
+        if 'フリーフロー' in raw:
+            opts.append('フリーフロー2h')
+        elif 'フリー' in raw:
+            opts.append('フリー2h')
+    return '＋' + '+'.join(opts) if opts else ''
 
 
 # ── メインプラン名フォーマット ──────────────────────────────
@@ -120,9 +163,33 @@ def _format_plan(plan: str) -> str:
     plan = re.sub(r'^\s*\d{1,2}/\d{1,2}[～~]\s*', '', plan)
     plan = re.sub(r'^(NEW〇[^〇]*〇|NEW)\s*', '', plan)
 
-    # ─ AT系プランを最優先処理 ─
+    # ─ ハイティー系プランを優先処理 ─
+    if 'ハイティー' in plan:
+        label = 'チェリーHT' if 'チェリー' in plan else 'ハイティー'
+        return label + _extract_ht_opts(plan)
+
+    # ─ AT系プランを優先処理 ─
+    if 'チェリーアフタヌーンティー' in plan:
+        return 'AT' + _extract_at_opts(plan)
     if 'いちごみるくアフタヌーンティー' in plan or 'アフタヌーンティー' in plan:
         return 'AT' + _extract_at_opts(plan)
+
+    # ─ 食べログ 『』 形式のプラン名 ─
+    m_kagi = re.search(r'[『｢]([^』｣]+)[』｣]', plan)
+    if m_kagi:
+        inner = m_kagi.group(1)
+        for kw, label in _MAIN_KW_MAP:
+            if kw in inner:
+                return label  # ラベル自体にオプション込みのため追加抽出不要
+        return inner[:22].strip()
+
+    # ─ スペシャルプラン → 女子会プラン＋○H ─
+    if 'スペシャルプラン' in plan:
+        m_h = re.search(r'([0-9０-９]+)\s*(?:時間|[hｈH])', plan)
+        if m_h:
+            h = m_h.group(1).translate(str.maketrans('0123456789', '０１２３４５６７８９'))
+            return f'女子会プラン＋{h}H'
+        return '女子会プラン'
 
     # ─ 【】ブラケットを解析 ─
     main_label = None
@@ -132,7 +199,7 @@ def _format_plan(plan: str) -> str:
     for m in re.finditer(r'【([^】]+)】', plan):
         content = m.group(1)
         last_end = m.end()
-        if any(q in content for q in _BRACKET_QUALIFIERS):
+        if any(q in content for q in _BRACKET_QUALIFIERS) or _BRACKET_QUALIFIER_RE.search(content):
             continue
         # ★以降を除去してメイン名を抽出
         content_clean = re.sub(r'★.*$', '', content).strip()
@@ -234,5 +301,9 @@ def normalize(reservations: list[Reservation]) -> list[Reservation]:
         r.purpose = _infer_purpose(r)
         if r.table.startswith("T") and r.table[1:].isdigit():
             r.table = f"T{int(r.table[1:]):02d}"
+        # Google予約: ダミー名（グーグル ヨヤク）を備考の実名で置き換える
+        if r.source == "Google" and DUMMY_NAME_RE.search(r.name) and r.notes:
+            r.name  = r.notes.strip()
+            r.notes = ""
     reservations.sort(key=lambda x: x.time_start)
     return reservations
